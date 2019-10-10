@@ -15,7 +15,7 @@ int overlay = 0;
 long delay = 500;
 char * directory = NULL;
 char pathname[18];
-uint8_t targetPortNo = 99;
+char *targetPath = NULL;
 
 int out_ep;
 int in_ep;
@@ -44,7 +44,7 @@ void usage(int error)
 	fprintf(dest, "        -m delay         : Microseconds delay between checking for new devices (default 500)\n");
 	fprintf(dest, "        -v               : Verbose\n");
 	fprintf(dest, "        -s               : Signed using bootsig.bin\n");
-	fprintf(dest, "        -0/1/2/3/4/5/6   : Only look for CMs attached to USB port number 0-6\n");
+	fprintf(dest, "        -p path          : Only look for CMs with given USB path\n");
 	fprintf(dest, "        -h               : This help\n");
 
 	exit(error ? -1 : 0);
@@ -60,7 +60,6 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 	uint32_t i = 0;
 	int r, j, len;
 	uint8_t path[8];	// Needed for libusb_get_port_numbers
-	uint8_t portNo = 0;
 
 	if (libusb_get_device_list(ctx, &devs) < 0)
 		return NULL;
@@ -72,27 +71,16 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 		if (r < 0)
 			goto out;
 
-		if(overlay || verbose == 2)
-		{
-			r = libusb_get_port_numbers(dev, path, sizeof(path));
-			len = snprintf(&pathname[len], 18-len, "%d", libusb_get_bus_number(dev));
-			if (r > 0) {
-				len += snprintf(&pathname[len], 18-len, "-");
-				len += snprintf(&pathname[len], 18-len, "%d", path[0]);
-				for (j = 1; j < r; j++)
-				{
-					len += snprintf(&pathname[len], 18-len, ".%d", path[j]);
-				}
+		r = libusb_get_port_numbers(dev, path, sizeof(path));
+		len = snprintf(&pathname[len], 18-len, "%d", libusb_get_bus_number(dev));
+		if (r > 0) {
+			len += snprintf(&pathname[len], 18-len, "-");
+			len += snprintf(&pathname[len], 18-len, "%d", path[0]);
+			for (j = 1; j < r; j++)
+			{
+				len += snprintf(&pathname[len], 18-len, ".%d", path[j]);
 			}
 		}
-
-		/*
-		  http://libusb.sourceforge.net/api-1.0/group__dev.html#ga14879a0ea7daccdcddb68852d86c00c4
-
-		  The port number returned by this call is usually guaranteed to be uniquely tied to a physical port,
-		  meaning that different devices plugged on the same physical port should return the same port number.
-		*/
-		portNo = libusb_get_port_number(dev);
 
 		if(verbose == 2)
 		{
@@ -111,7 +99,7 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 				///////////////////////////////////////////////////////////////////////
 				// Check if we should match against a specific port number
 				///////////////////////////////////////////////////////////////////////
-				if (targetPortNo == 99 || portNo == targetPortNo)
+				if (!targetPath || !strcmp(targetPath, pathname))
 				{
 					if(verbose) printf("Device located successfully\n");
 					found = dev;
@@ -120,7 +108,7 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 				else
 				{
 					if(verbose == 2)
-					      printf("...Wrong Port, Trying again\n");
+					      printf("...Wrong Path, Trying again\n");
 				}
 			}
 		}
@@ -279,33 +267,12 @@ void get_options(int argc, char *argv[])
 		{
 			signed_boot = 1;
 		}
-		else if(strcmp(*argv, "-0") == 0)
+		else if(strcmp(*argv, "-p") == 0)
 		{
-			targetPortNo = 0;
-		}
-		else if(strcmp(*argv, "-1") == 0)
-		{
-			targetPortNo = 1;
-		}
-		else if(strcmp(*argv, "-2") == 0)
-		{
-			targetPortNo = 2;
-		}
-		else if(strcmp(*argv, "-3") == 0)
-		{
-			targetPortNo = 3;
-		}
-		else if(strcmp(*argv, "-4") == 0)
-		{
-			targetPortNo = 4;
-		}
-		else if(strcmp(*argv, "-5") == 0)
-		{
-			targetPortNo = 5;
-		}
-		else if(strcmp(*argv, "-6") == 0)
-		{
-			targetPortNo = 6;
+			argv++; argc--;
+			if(argc < 1)
+				usage(1);
+			targetPath = *argv;
 		}
 		else
 		{
