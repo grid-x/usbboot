@@ -363,28 +363,34 @@ int second_stage_boot(libusb_device_handle *usb_device)
 FILE * check_file(char * dir, char *fname)
 {
 	FILE * fp = NULL;
-	char path[256];
+	int len;
+	char *path;
 
 	// Check directory first then /usr/share/rpiboot
 	if(dir)
 	{
 		if(overlay&&(pathname != NULL))
 		{
+			len = strlen(dir)+strlen(pathname)+strlen(fname)+3;
+			path = malloc(len);
 			strcpy(path, dir);
 			strcat(path, "/");
 			strcat(path, pathname);
 			strcat(path, "/");
 			strcat(path, fname);
 			fp = fopen(path, "rb");
-			memset(path, 0, sizeof(path));
+			free(path);
 		}
 
 		if (fp == NULL)
 		{
+			len = strlen(dir)+strlen(fname)+2;
+			path = malloc(len);
 			strcpy(path, dir);
 			strcat(path, "/");
 			strcat(path, fname);
 			fp = fopen(path, "rb");
+			free(path);
 		}
 	}
 
