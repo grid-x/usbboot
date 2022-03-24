@@ -1,4 +1,4 @@
-#include <libusb-1.0/libusb.h>
+#include <libusb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +7,13 @@
 
 #include "msd/bootcode.h"
 #include "msd/start.h"
+#include "msd/bootcode4.h"
+#include "msd/start4.h"
+
+/* Assume BSD without native fmemopen() if doesn't seem to be glibc */
+#if defined(__APPLE__) || (!defined(_GNU_SOURCE) && (!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L))
+#include "fmemopen.c" // BSD fmemopen() compat in terms of funopen()
+#endif
 
 int signed_boot = 0;
 int verbose = 0;
@@ -14,11 +21,15 @@ int loop = 0;
 int overlay = 0;
 long delay = 500;
 char * directory = NULL;
-char pathname[18];
+char pathname[18] = {0};
 char *targetPath = NULL;
 
 int out_ep;
 int in_ep;
+int bcm2711;
+
+static FILE * check_file(const char * dir, const char *fname, int use_fmem);
+static int second_stage_prep(FILE *fp, FILE *fp_sig);
 
 typedef struct MESSAGE_S {
 		int length;
@@ -34,6 +45,10 @@ void usage(int error)
 	fprintf(dest, "Boot a Raspberry Pi in device mode either directly into a mass storage device\n");
 	fprintf(dest, "or provide a set of boot files in a directory from which to boot.  This can\n");
 	fprintf(dest, "then contain a initramfs to boot through to linux kernel\n\n");
+	fprintf(dest, "To flash the default bootloader EEPROM image on Compute Module 4 run\n");
+	fprintf(dest, "rpiboot -d recovery\n\n");
+	fprintf(dest, "For more information about the bootloader EEPROM please see:\n");
+	fprintf(dest, "https://www.raspberrypi.org/documentation/hardware/raspberrypi/booteeprom.md\n\n");
 	fprintf(dest, "rpiboot                  : Boot the device into mass storage device\n");
 	fprintf(dest, "rpiboot -d [directory]   : Boot the device using the boot files in 'directory'\n");
 	fprintf(dest, "Further options:\n");
@@ -93,8 +108,47 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 			   desc.idProduct == 0x2764 ||
 			   desc.idProduct == 0x2711)
 			{
+				FILE *fp_second_stage = NULL;
+				FILE *fp_sign = NULL;
+				const char *second_stage;
+
 				if(verbose == 2)
-				      printf("Found candidate Compute Module...");
+					printf("Found candidate Compute Module...");
+
+				bcm2711 = (desc.idProduct == 0x2711);
+				if (bcm2711)
+					second_stage = "bootcode4.bin";
+				else
+					second_stage = "bootcode.bin";
+
+				fp_second_stage = check_file(directory, second_stage, 1);
+				if (!fp_second_stage)
+				{
+					fprintf(stderr, "Failed to open %s\n", second_stage);
+					exit(1);
+				}
+
+				if (signed_boot && !bcm2711) // Signed boot use a different mechanism on BCM2711
+				{
+					const char *sig_file = "bootcode.sig";
+					fp_sign = check_file(directory, sig_file, 1);
+					if (!fp_sign)
+					{
+						fprintf(stderr, "Unable to open '%s'\n", sig_file);
+						usage(1);
+					}
+				}
+
+				if (second_stage_prep(fp_second_stage, fp_sign) != 0)
+				{
+					fprintf(stderr, "Failed to prepare the second stage bootcode\n");
+					exit(-1);
+				}
+				if (fp_second_stage)
+					fclose(fp_second_stage);
+
+				if (fp_sign)
+					fclose(fp_sign);
 
 				///////////////////////////////////////////////////////////////////////
 				// Check if we should match against a specific port number
@@ -117,7 +171,12 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 	if (found) {
 		sleep(1);
 		r = libusb_open(found, &handle);
-		if (r < 0)
+		if (r == LIBUSB_ERROR_ACCESS)
+		{
+			printf("Permission to access USB device denied. Make sure you are a member of the plugdev group.\n");
+			exit(-1);
+		}
+		else if (r < 0)
 		{
 			if(verbose) printf("Failed to open the requested device\n");
 			handle = NULL;
@@ -216,7 +275,7 @@ int ep_read(void *buf, int len, libusb_device_handle * usb_device)
 	    libusb_control_transfer(usb_device,
 				    LIBUSB_REQUEST_TYPE_VENDOR |
 				    LIBUSB_ENDPOINT_IN, 0, len & 0xffff,
-				    len >> 16, buf, len, 2000);
+				    len >> 16, buf, len, 3000);
 	if(ret >= 0)
 		return len;
 	else
@@ -307,6 +366,10 @@ int second_stage_prep(FILE *fp, FILE *fp_sig)
 		fread(boot_message.signature, 1, sizeof(boot_message.signature), fp_sig);
 	}
 
+	if (second_stage_txbuf)
+		free(second_stage_txbuf);
+	second_stage_txbuf = NULL;
+
 	second_stage_txbuf = (uint8_t *) malloc(boot_message.length);
 	if (second_stage_txbuf == NULL)
 	{
@@ -352,7 +415,7 @@ int second_stage_boot(libusb_device_handle *usb_device)
 	}
 	else
 	{
-		printf("Failed : 0x%x", retcode);
+		printf("Failed : 0x%x\n", retcode);
 	}
 
 	return retcode;
@@ -360,16 +423,24 @@ int second_stage_boot(libusb_device_handle *usb_device)
 }
 
 
-FILE * check_file(char * dir, char *fname)
+FILE * check_file(const char * dir, const char *fname, int use_fmem)
 {
 	FILE * fp = NULL;
 	int len;
 	char *path;
 
-	// Check directory first then /usr/share/rpiboot
+	// Prevent USB device from requesting files in parent directories
+	if(strstr(fname, ".."))
+	{
+		printf("Denying request for filename containing .. to prevent path traversal\n");
+		return NULL;
+	}
+
 	if(dir)
 	{
-		if(overlay&&(pathname != NULL))
+		if(overlay && (pathname[0] != 0) &&
+				(strcmp(fname, "bootcode4.bin") != 0) &&
+				(strcmp(fname, "bootcode.bin") != 0))
 		{
 			len = strlen(dir)+strlen(pathname)+strlen(fname)+3;
 			path = malloc(len);
@@ -379,6 +450,9 @@ FILE * check_file(char * dir, char *fname)
 			strcat(path, "/");
 			strcat(path, fname);
 			fp = fopen(path, "rb");
+			if (fp)
+				printf("Loading: %s\n", path);
+			memset(path, 0, sizeof(path));
 			free(path);
 		}
 
@@ -390,17 +464,32 @@ FILE * check_file(char * dir, char *fname)
 			strcat(path, "/");
 			strcat(path, fname);
 			fp = fopen(path, "rb");
+			if (fp)
+				printf("Loading: %s\n", path);
 			free(path);
 		}
 	}
 
-	if(fp == NULL)
+	// Failover to fmem unless use_fmem is zero in which case this function
+	// is being used to check if a file exists.
+	if(fp == NULL && use_fmem)
 	{
-		if(strcmp(fname, "bootcode.bin") == 0)
-			fp = fmemopen(msd_bootcode_bin, msd_bootcode_bin_len, "rb");
+		if (bcm2711)
+		{
+			if(strcmp(fname, "bootcode4.bin") == 0)
+				fp = fmemopen(msd_bootcode4_bin, msd_bootcode4_bin_len, "rb");
+			else if(strcmp(fname, "start4.elf") == 0)
+				fp = fmemopen(msd_start4_elf, msd_start4_elf_len, "rb");
+		}
 		else
-			if(strcmp(fname, "start.elf") == 0)
+		{
+			if(strcmp(fname, "bootcode.bin") == 0)
+				fp = fmemopen(msd_bootcode_bin, msd_bootcode_bin_len, "rb");
+			else if(strcmp(fname, "start.elf") == 0)
 				fp = fmemopen(msd_start_elf, msd_start_elf_len, "rb");
+		}
+		if (fp)
+			printf("Loading embedded: %s\n", fname);
 	}
 
 	return fp;
@@ -441,7 +530,7 @@ int file_server(libusb_device_handle * usb_device)
 			case 0: // Get file size
 				if(fp)
 					fclose(fp);
-				fp = check_file(directory, message.fname);
+				fp = check_file(directory, message.fname, 1);
 				if(strlen(message.fname) && fp != NULL)
 				{
 					int file_size;
@@ -527,8 +616,6 @@ int file_server(libusb_device_handle * usb_device)
 
 int main(int argc, char *argv[])
 {
-	FILE * second_stage;
-	FILE * fp_sign = NULL;
 	libusb_context *ctx;
 	libusb_device_handle *usb_device;
 	struct libusb_device_descriptor desc;
@@ -536,42 +623,42 @@ int main(int argc, char *argv[])
 
 	get_options(argc, argv);
 
+	printf("RPIBOOT: build-date %s version %s %s\n", __DATE__, PKG_VER, GIT_VER);
+
 	// flush immediately
 	setbuf(stdout, NULL);
 
-#if defined (__CYGWIN__)
-	//printf("Running under Cygwin\n");
-#else
-	//exit if not run as sudo
-	if(getuid() != 0)
+	// If the boot directory is specified then check that it contains bootcode files.
+	if (directory)
 	{
-		printf("Must be run with sudo...\n");
-		exit(-1);
-	}
-#endif
+		FILE *f, *f4;
 
+		if (verbose)
+			printf("Boot directory '%s'\n", directory);
 
-	second_stage = check_file(directory, "bootcode.bin");
-	if(second_stage == NULL)
-	{
-		fprintf(stderr, "Unable to open 'bootcode.bin' from /usr/share/rpiboot/msd or supplied directory\n");
-		usage(1);
-	}
-
-	if(signed_boot)
-	{
-		fp_sign = check_file(directory, "bootsig.bin");
-		if(fp_sign == NULL)
+		f = check_file(directory, "bootcode.bin", 0);
+		f4 = check_file(directory, "bootcode4.bin", 0);
+		if (!f && !f4)
 		{
-			fprintf(stderr, "Unable to open 'bootsig.bin'\n");
+			fprintf(stderr, "No 'bootcode' files found in '%s'\n", directory);
 			usage(1);
 		}
-	}
 
-	if(second_stage_prep(second_stage, fp_sign) != 0)
-	{
-		fprintf(stderr, "Failed to prepare the second stage bootcode\n");
-		exit(-1);
+		if (f)
+			fclose(f);
+		if (f4)
+			fclose(f4);
+
+		if (signed_boot)
+		{
+			f = check_file(directory, "bootsig.bin", 0);
+			if (!f)
+			{
+				fprintf(stderr, "Unable to open 'bootsig.bin' from %s\n", directory);
+				usage(1);
+			}
+			fclose(f);
+		}
 	}
 
 	int ret = libusb_init(&ctx);
@@ -581,13 +668,21 @@ int main(int argc, char *argv[])
 		exit(-1);
 	}
 
+#if LIBUSBX_API_VERSION < 0x01000106
 	libusb_set_debug(ctx, verbose ? LIBUSB_LOG_LEVEL_WARNING : 0);
+#else
+	libusb_set_option(
+		ctx,
+		LIBUSB_OPTION_LOG_LEVEL,
+		verbose ? verbose == 2 ? LIBUSB_LOG_LEVEL_INFO : LIBUSB_LOG_LEVEL_WARNING : 0
+		);
+#endif
 
 	do
 	{
 		int last_serial = -1;
 
-		printf("Waiting for BCM2835/6/7\n");
+		printf("Waiting for BCM2835/6/7/2711...\n");
 
 		// Wait for a device to get plugged in
 		do
@@ -618,7 +713,7 @@ int main(int argc, char *argv[])
 		while (ret);
 
 		last_serial = desc.iSerialNumber;
-		if(desc.iSerialNumber == 0 || desc.idProduct == 0x2711)
+		if(desc.iSerialNumber == 0 || desc.iSerialNumber == 3)
 		{
 			printf("Sending bootcode.bin\n");
 			second_stage_boot(usb_device);
@@ -632,7 +727,7 @@ int main(int argc, char *argv[])
 		libusb_close(usb_device);
 		sleep(1);
 	}
-	while(loop || desc.iSerialNumber == 0);
+	while(loop || desc.iSerialNumber == 0 || desc.iSerialNumber == 3);
 
 	libusb_exit(ctx);
 
